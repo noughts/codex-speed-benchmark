@@ -49,6 +49,33 @@ test_missing_jq_message() {
   [[ "$message" == *"brew install jq"* ]] || fail "missing jq message should include installation command"
 }
 
+test_timeout() {
+  local exit_code=0
+
+  sleep 2 &
+  local process_id=$!
+  wait_with_timeout "$process_id" 0 || exit_code=$?
+  assert_equal "124" "$exit_code" "timeout exit code"
+  ! kill -0 "$process_id" 2>/dev/null || fail "timed out process should be stopped"
+}
+
+test_skill_config() {
+  local config=$(build_skill_config imagegen openai-docs)
+
+  assert_equal 'skills.config=[{name="imagegen",enabled=false},{name="openai-docs",enabled=false}]' \
+    "$config" "skill config"
+}
+
+test_timeout_retry() {
+  run_once() {
+    (( $2 == 1 )) && return 124
+    print '{"retried":true}'
+  }
+
+  local result=$(run_with_retry 1 'skills.config=[]' 2>/dev/null)
+  assert_json_field "true" "retried" "$result"
+}
+
 test_median() {
   TEST_TEMP=$(mktemp /tmp/codex-speed-results.XXXXXX)
   print '{"total_tps":30,"visible_tps":20,"ttft_ms":3000}' >> "$TEST_TEMP"
@@ -64,5 +91,8 @@ test_median() {
 test_parse_run
 test_tool_rejection
 test_missing_jq_message
+test_timeout
+test_skill_config
 test_median
+test_timeout_retry
 print "All tests passed."

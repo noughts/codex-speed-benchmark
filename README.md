@@ -13,7 +13,7 @@ A small macOS benchmark for comparing Codex text-generation speed under isolated
 zsh benchmark.zsh
 ```
 
-The benchmark makes one warm-up request and five measured requests using GPT-5.6 Sol, low reasoning, and Fast mode. It runs Codex with isolated temporary home directories so personal MCP servers, skills, plugins, AGENTS.md files, memories, and prior sessions are not loaded. Temporary authentication and response data are deleted on exit.
+The benchmark makes one warm-up request and five measured requests using GPT-5.6 Sol, low reasoning, and Fast mode. It runs Codex with an isolated temporary home, disables every discovered system skill, and verifies that no personal MCP servers or plugins are installed. Each run has a 120-second timeout and one retry for transient timeouts. Temporary authentication and response data are deleted on exit.
 
 Progress is written to stderr. The final stdout block can be pasted directly into Slack.
 
