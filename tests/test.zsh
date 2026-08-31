@@ -1,0 +1,60 @@
+#!/bin/zsh
+
+setopt errexit nounset pipefail
+
+typeset -gr TEST_ROOT=${0:A:h}
+typeset TEST_TEMP=""
+source "$TEST_ROOT/../benchmark.zsh"
+
+cleanup_test() {
+  [[ -n "$TEST_TEMP" && -f "$TEST_TEMP" ]] && unlink "$TEST_TEMP"
+}
+
+trap cleanup_test EXIT
+
+assert_equal() {
+  local expected=$1
+  local actual=$2
+  local label=$3
+
+  [[ "$actual" == "$expected" ]] || fail "$label: expected '$expected', got '$actual'"
+}
+
+assert_json_field() {
+  local expected=$1
+  local field=$2
+  local json=$3
+
+  assert_equal "$expected" "$(jq -r ".$field" <<< "$json")" "$field"
+}
+
+test_parse_run() {
+  local result=$(parse_run "$TEST_ROOT/fixtures/success.jsonl")
+
+  assert_json_field "50" "total_tps" "$result"
+  assert_json_field "40" "visible_tps" "$result"
+  assert_json_field "2000" "ttft_ms" "$result"
+}
+
+test_tool_rejection() {
+  if parse_run "$TEST_ROOT/fixtures/tool-call.jsonl" >/dev/null 2>&1; then
+    fail "tool call fixture should have been rejected"
+  fi
+}
+
+test_median() {
+  TEST_TEMP=$(mktemp /tmp/codex-speed-results.XXXXXX)
+  print '{"total_tps":30,"visible_tps":20,"ttft_ms":3000}' >> "$TEST_TEMP"
+  print '{"total_tps":10,"visible_tps":40,"ttft_ms":1000}' >> "$TEST_TEMP"
+  print '{"total_tps":50,"visible_tps":30,"ttft_ms":2000}' >> "$TEST_TEMP"
+  local result=$(median_summary "$TEST_TEMP")
+
+  assert_json_field "30" "total_tps" "$result"
+  assert_json_field "30" "visible_tps" "$result"
+  assert_json_field "2000" "ttft_ms" "$result"
+}
+
+test_parse_run
+test_tool_rejection
+test_median
+print "All tests passed."
