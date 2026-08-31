@@ -42,6 +42,13 @@ test_tool_rejection() {
   fi
 }
 
+test_missing_jq_message() {
+  local message
+
+  message=$(PATH=/nonexistent require_jq 2>&1) && fail "missing jq should have failed"
+  [[ "$message" == *"brew install jq"* ]] || fail "missing jq message should include installation command"
+}
+
 test_median() {
   TEST_TEMP=$(mktemp /tmp/codex-speed-results.XXXXXX)
   print '{"total_tps":30,"visible_tps":20,"ttft_ms":3000}' >> "$TEST_TEMP"
@@ -56,5 +63,6 @@ test_median() {
 
 test_parse_run
 test_tool_rejection
+test_missing_jq_message
 test_median
 print "All tests passed."

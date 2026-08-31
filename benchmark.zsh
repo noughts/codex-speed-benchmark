@@ -47,6 +47,11 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "Required command '$1' was not found."
 }
 
+require_jq() {
+  command -v jq >/dev/null 2>&1 \
+    || fail "jq is required. Install it with: brew install jq"
+}
+
 cleanup() {
   [[ -n "$BENCHMARK_ROOT" && -d "$BENCHMARK_ROOT" ]] || return 0
   find "$BENCHMARK_ROOT" ! -type d -exec unlink {} \; 2>/dev/null
@@ -176,7 +181,7 @@ initialize() {
   setopt errexit nounset pipefail extendedglob
   umask 077
   require_command codex
-  require_command jq || fail "Install jq with: brew install jq"
+  require_jq
   CODEX_BIN=$(command -v codex)
   ORIGINAL_CODEX_HOME=${CODEX_HOME:-$HOME/.codex}
   [[ -r "$ORIGINAL_CODEX_HOME/auth.json" ]] || fail "Codex authentication was not found. Run: codex login"
