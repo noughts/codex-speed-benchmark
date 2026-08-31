@@ -1,9 +1,16 @@
 #!/bin/zsh
 
-typeset -gr BENCHMARK_VERSION="2"
+if [ -z "${ZSH_VERSION:-}" ]; then
+  if [ ! -x /bin/zsh ]; then
+    echo "Error: this benchmark requires zsh." >&2
+    exit 1
+  fi
+  exec /bin/zsh "$0" "$@"
+fi
+
+typeset -gr BENCHMARK_VERSION="3"
 typeset -gr MODEL="gpt-5.6-sol"
 typeset -gr REASONING_EFFORT="low"
-typeset -gr SERVICE_TIER="fast"
 typeset -gr MEASURED_RUNS=5
 typeset -gr WARMUP_RUNS=1
 typeset -gr RUN_TIMEOUT_SECONDS=120
@@ -48,10 +55,24 @@ typeset BENCHMARK_ROOT=""
 typeset ORIGINAL_CODEX_HOME=""
 typeset CODEX_BIN=""
 typeset ISOLATED_ROOT=""
+typeset SERVICE_TIER=""
 
 fail() {
   print -u2 -- "Error: $1"
   return 1
+}
+
+parse_service_tier() {
+  if (( $# > 1 )); then
+    fail "Usage: $0 [default|fast]"
+    return 1
+  fi
+  local tier=${1:-default}
+
+  case $tier in
+    default|fast) print -r -- "$tier" ;;
+    *) fail "Usage: $0 [default|fast]" ;;
+  esac
 }
 
 require_command() {
@@ -258,7 +279,7 @@ print_header() {
   print "jq: $jq_version"
   print "Model: $MODEL"
   print "Reasoning: $REASONING_EFFORT"
-  print "Service tier: $SERVICE_TIER"
+  print "Requested service tier: $SERVICE_TIER"
   print "Runs: $MEASURED_RUNS (+ $WARMUP_RUNS warm-up)"
 }
 
@@ -287,6 +308,7 @@ print_summary() {
 initialize() {
   setopt errexit nounset pipefail extendedglob
   umask 077
+  SERVICE_TIER=$(parse_service_tier "$@")
   require_command codex
   require_jq
   CODEX_BIN=$(command -v codex)
@@ -320,7 +342,7 @@ execute_benchmark() {
 }
 
 main() {
-  initialize
+  initialize "$@"
   execute_benchmark
 }
 

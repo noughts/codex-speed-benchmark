@@ -49,6 +49,27 @@ test_missing_jq_message() {
   [[ "$message" == *"brew install jq"* ]] || fail "missing jq message should include installation command"
 }
 
+test_service_tier() {
+  assert_equal "default" "$(parse_service_tier)" "default service tier"
+  assert_equal "default" "$(parse_service_tier default)" "explicit default service tier"
+  assert_equal "fast" "$(parse_service_tier fast)" "fast service tier"
+  ! parse_service_tier slow >/dev/null 2>&1 || fail "invalid service tier should fail"
+  ! parse_service_tier default fast >/dev/null 2>&1 || fail "extra arguments should fail"
+}
+
+test_sh_reexec() {
+  local message
+
+  message=$(PATH=/nonexistent /bin/sh "$TEST_ROOT/../benchmark.zsh" fast 2>&1) \
+    && fail "benchmark should fail without codex"
+  [[ "$message" == *"Required command 'codex'"* ]] \
+    || fail "sh should re-execute the benchmark with zsh"
+
+  message=$(/bin/sh "$TEST_ROOT/../benchmark.zsh" invalid 2>&1) \
+    && fail "sh should preserve an invalid service tier argument"
+  [[ "$message" == *"Usage:"* ]] || fail "sh should preserve benchmark arguments"
+}
+
 test_timeout() {
   local exit_code=0
 
@@ -91,6 +112,8 @@ test_median() {
 test_parse_run
 test_tool_rejection
 test_missing_jq_message
+test_service_tier
+test_sh_reexec
 test_timeout
 test_skill_config
 test_median
