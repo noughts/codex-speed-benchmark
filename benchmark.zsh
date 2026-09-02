@@ -8,7 +8,7 @@ if [ -z "${ZSH_VERSION:-}" ]; then
   exec /bin/zsh "$0" "$@"
 fi
 
-typeset -gr BENCHMARK_VERSION="4"
+typeset -gr BENCHMARK_VERSION="5"
 typeset -gr MODEL="gpt-5.6-sol"
 typeset -gr BEDROCK_MODEL="openai.gpt-5.6-sol"
 typeset -gr REASONING_EFFORT="low"
@@ -66,6 +66,8 @@ typeset SERVICE_TIER=""
 typeset MODEL_PROVIDER=""
 typeset AUTHENTICATION=""
 typeset CODEX_RUNTIME_HOME=""
+typeset AWS_BENCHMARK_REGION=""
+typeset -ga BEDROCK_CONFIG_ARGS=()
 
 fail() {
   print -u2 -- "Error: $1"
@@ -139,12 +141,92 @@ detect_authentication() {
   parse_authentication "$login_status"
 }
 
+parse_bedrock_aws_setting() {
+  local key=$1
+  local config=$2
+
+  awk -v key="$key" '
+    /^[[:space:]]*\[/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\][[:space:]]*$/, "", section)
+      next
+    }
+    {
+      line = $0
+      sub(/#.*$/, "", line)
+      if (section == "model_providers.amazon-bedrock.aws" \
+        && match(line, "^[[:space:]]*" key "[[:space:]]*=")) value = line
+      if (match(line, "^[[:space:]]*model_providers\\.amazon-bedrock\\.aws\\." key "[[:space:]]*=")) value = line
+    }
+    END {
+      if (value == "") exit 1
+      sub(/^[^=]*=[[:space:]]*/, "", value)
+      gsub(/^["\047]|["\047][[:space:]]*$/, "", value)
+      if (value == "") exit 1
+      print value
+    }
+  ' <<< "$config"
+}
+
+# --ignore-user-config discards [model_providers.amazon-bedrock.aws], which is the
+# only place Codex is told the Bedrock region and AWS profile. Re-inject them so an
+# isolated run reaches the same endpoint as a normal one.
+detect_bedrock_config_args() {
+  local config=""
+  local region=""
+  local profile=""
+
+  [[ -r "$ORIGINAL_CODEX_HOME/config.toml" ]] && config=$(<"$ORIGINAL_CODEX_HOME/config.toml")
+  region=$(parse_bedrock_aws_setting region "$config" 2>/dev/null) || region=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
+  profile=$(parse_bedrock_aws_setting profile "$config" 2>/dev/null) || profile=${AWS_PROFILE:-}
+  [[ -n "$region" ]] || fail "Could not determine the Amazon Bedrock region. Set it in\
+ $ORIGINAL_CODEX_HOME/config.toml under [model_providers.amazon-bedrock.aws] or export AWS_REGION."
+  AWS_BENCHMARK_REGION=$region
+  BEDROCK_CONFIG_ARGS=(-c "model_providers.amazon-bedrock.aws.region=\"$region\"")
+  [[ -n "$profile" ]] \
+    && BEDROCK_CONFIG_ARGS+=(-c "model_providers.amazon-bedrock.aws.profile=\"$profile\"")
+  return 0
+}
+
 model_for_provider() {
   [[ $1 == amazon-bedrock ]] && print "$BEDROCK_MODEL" || print "$MODEL"
 }
 
 provider_name() {
   [[ $1 == amazon-bedrock ]] && print "Amazon Bedrock" || print "OpenAI"
+}
+
+format_host() {
+  local chip=$1
+  local model=$2
+  local cores=$3
+  local memory_bytes=$4
+  local memory="unknown"
+
+  [[ $memory_bytes == <-> ]] && memory="$(( memory_bytes / 1024 ** 3 )) GB"
+  print -r -- "${chip:-unknown} (${model:-unknown}), ${cores:-unknown} cores, $memory"
+}
+
+sysctl_value() {
+  local value
+
+  value=$(sysctl -n "$1" 2>/dev/null) || value=""
+  print -r -- "$value"
+}
+
+detect_host() {
+  format_host "$(sysctl_value machdep.cpu.brand_string)" "$(sysctl_value hw.model)" \
+    "$(sysctl_value hw.ncpu)" "$(sysctl_value hw.memsize)"
+}
+
+detect_macos() {
+  local version
+  local build
+
+  version=$(sw_vers -productVersion 2>/dev/null) || version=""
+  build=$(sw_vers -buildVersion 2>/dev/null) || build=""
+  print -r -- "${version:-unknown} (${build:-unknown})"
 }
 
 cleanup() {
@@ -261,8 +343,11 @@ run_once() {
   local result
   local -a provider_args=(-c "model_provider=\"$MODEL_PROVIDER\"")
 
-  [[ $MODEL_PROVIDER == openai ]] \
-    && provider_args+=(-c "service_tier=\"$SERVICE_TIER\"")
+  if [[ $MODEL_PROVIDER == openai ]]; then
+    provider_args+=(-c "service_tier=\"$SERVICE_TIER\"")
+  else
+    provider_args+=("${BEDROCK_CONFIG_ARGS[@]}")
+  fi
 
   mkdir "$run_root"
   run_isolated_codex exec --json --ignore-user-config --skip-git-repo-check \
@@ -276,12 +361,23 @@ run_once() {
     print -u2 -- "Codex timed out after $RUN_TIMEOUT_SECONDS seconds on run $run_number."
     return 124
   fi
-  (( exit_code == 0 )) || fail "Codex failed on run $run_number. See stderr output below:\n$(<"$error_log")"
+  # ERR_EXIT is suppressed inside the `if` condition that calls this function, so every
+  # failure must return explicitly or the run reports success with an empty result.
+  (( exit_code == 0 )) || {
+    fail "Codex failed on run $run_number. See details below:\n$(jq -sr '
+      [.[] | select(.type == "error") | .message] | last // "no error event"' "$public_events")\n$(<"$error_log")"
+    return 1
+  }
   thread_id=$(jq -sr '[.[] | select(.type == "thread.started") | .thread_id] | last // empty' "$public_events")
-  [[ -n "$thread_id" ]] || fail "Codex did not report a thread ID on run $run_number."
+  [[ -n "$thread_id" ]] || {
+    fail "Codex did not report a thread ID on run $run_number."
+    return 1
+  }
   rollout_file=$(find_rollout "$ISOLATED_ROOT" "$thread_id") || return 1
-  result=$(parse_run "$rollout_file" "$MODEL_PROVIDER") \
-    || fail "Run $run_number did not produce a valid isolated benchmark result."
+  result=$(parse_run "$rollout_file" "$MODEL_PROVIDER") || {
+    fail "Run $run_number did not produce a valid isolated benchmark result."
+    return 1
+  }
   print -r -- "$result"
 }
 
@@ -290,12 +386,15 @@ run_with_retry() {
   local skill_config=$2
   local attempt
   local result
+  local exit_code
 
   for attempt in {1..$MAX_ATTEMPTS_PER_RUN}; do
-    if result=$(run_once "$run_number" "$attempt" "$skill_config"); then
+    exit_code=0
+    result=$(run_once "$run_number" "$attempt" "$skill_config") || exit_code=$?
+    if (( exit_code == 0 )); then
       print -r -- "$result"
       return 0
-    elif (( $? != 124 )); then
+    elif (( exit_code != 124 )); then
       return 1
     fi
     (( attempt < MAX_ATTEMPTS_PER_RUN )) \
@@ -344,6 +443,8 @@ print_header() {
 
   print "Codex Speed Benchmark v$BENCHMARK_VERSION"
   print "Date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  print "Host: $(detect_host)"
+  print "macOS: $(detect_macos)"
   print "Isolation: MCP / Skills / Plugins / AGENTS disabled"
   print "Codex CLI: $codex_version"
   print "jq: $jq_version"
@@ -352,6 +453,7 @@ print_header() {
   print "Model: $model"
   print "Reasoning: $REASONING_EFFORT"
   [[ $MODEL_PROVIDER == openai ]] && print "Requested service tier: $SERVICE_TIER"
+  [[ $MODEL_PROVIDER == amazon-bedrock ]] && print "AWS region: $AWS_BENCHMARK_REGION"
   print "Runs: $MEASURED_RUNS (+ $WARMUP_RUNS warm-up)"
 }
 
@@ -389,14 +491,12 @@ initialize() {
   AUTHENTICATION=$(detect_authentication "$MODEL_PROVIDER")
   [[ $MODEL_PROVIDER == amazon-bedrock || -r "$ORIGINAL_CODEX_HOME/auth.json" ]] \
     || fail "Codex authentication was not found. Run: codex login"
+  [[ $MODEL_PROVIDER == amazon-bedrock ]] && detect_bedrock_config_args
   BENCHMARK_ROOT=$(mktemp -d /tmp/codex-speed-benchmark.XXXXXX)
   ISOLATED_ROOT="$BENCHMARK_ROOT/environment"
   CODEX_RUNTIME_HOME="$ISOLATED_ROOT/home"
   [[ $MODEL_PROVIDER == amazon-bedrock ]] && CODEX_RUNTIME_HOME=$HOME
-  trap cleanup EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  return 0
 }
 
 execute_benchmark() {
@@ -414,6 +514,12 @@ execute_benchmark() {
   done
 
   verify_isolation
+  local recorded=0
+  if [[ -f "$results_file" ]]; then
+    recorded=$(jq -se 'length' "$results_file")
+  fi
+  (( recorded == MEASURED_RUNS )) \
+    || fail "Expected $MEASURED_RUNS measured results but recorded $recorded."
   local summary=$(median_summary "$results_file")
   print_summary "$results_file" "$summary"
 }
@@ -424,5 +530,13 @@ main() {
 }
 
 if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
+  # These must be installed here, not inside a function: zsh runs an EXIT trap when the
+  # function that set it returns, so installing it in initialize() deleted the temporary
+  # directory immediately and left the real one behind at exit. A top-level EXIT trap runs
+  # once, at process exit, and is not inherited by command substitutions or background jobs.
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   main "$@"
 fi

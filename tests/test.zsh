@@ -50,6 +50,30 @@ test_model_provider() {
   ! validate_model_provider custom >/dev/null 2>&1 || fail "custom provider should be rejected"
 }
 
+test_bedrock_aws_setting() {
+  local config=$'model_provider = "amazon-bedrock"\n\n[model_providers.amazon-bedrock.aws]\nregion = "us-east-2"\nprofile = "ClaudeCode"\n'
+  local dotted=$'model_providers.amazon-bedrock.aws.region = "eu-west-1"  # inline comment\n'
+  local other=$'[model_providers.other.aws]\nregion = "ap-south-1"\n'
+  local region_only=$'[model_providers.amazon-bedrock.aws]\nregion = "us-east-2"\n'
+
+  assert_equal "us-east-2" "$(parse_bedrock_aws_setting region "$config")" "bedrock region"
+  assert_equal "ClaudeCode" "$(parse_bedrock_aws_setting profile "$config")" "bedrock profile"
+  assert_equal "eu-west-1" "$(parse_bedrock_aws_setting region "$dotted")" "dotted bedrock region"
+  ! parse_bedrock_aws_setting region "$other" >/dev/null 2>&1 \
+    || fail "another provider's region should not be used"
+  ! parse_bedrock_aws_setting profile "$region_only" >/dev/null 2>&1 \
+    || fail "a missing profile should be reported as absent"
+}
+
+test_host_metadata() {
+  assert_equal "Apple M5 Max (Mac17,6), 18 cores, 64 GB" \
+    "$(format_host 'Apple M5 Max' Mac17,6 18 68719476736)" "host description"
+  assert_equal "unknown (unknown), unknown cores, unknown" \
+    "$(format_host '' '' '' '')" "host description without sysctl values"
+  [[ "$(detect_host)" == *cores* ]] || fail "detect_host should report a core count"
+  [[ "$(detect_macos)" == *"("* ]] || fail "detect_macos should report a build number"
+}
+
 test_authentication() {
   assert_equal "ChatGPT" "$(parse_authentication 'Logged in using ChatGPT')" "ChatGPT auth"
   assert_equal "API key" \
@@ -135,6 +159,8 @@ test_median() {
 
 test_parse_run
 test_model_provider
+test_bedrock_aws_setting
+test_host_metadata
 test_authentication
 test_tool_rejection
 test_missing_jq_message
