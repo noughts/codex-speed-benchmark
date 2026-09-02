@@ -1,3 +1,3 @@
-{"type":"session_meta","payload":{"id":"fixture"}}
+{"type":"session_meta","payload":{"id":"fixture","model_provider":"openai"}}
 {"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":100,"total_tokens":600}}}}
 {"type":"event_msg","payload":{"type":"task_complete","duration_ms":12000,"time_to_first_token_ms":2000,"last_agent_message":"omitted"}}

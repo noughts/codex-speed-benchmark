@@ -8,8 +8,9 @@ if [ -z "${ZSH_VERSION:-}" ]; then
   exec /bin/zsh "$0" "$@"
 fi
 
-typeset -gr BENCHMARK_VERSION="3"
+typeset -gr BENCHMARK_VERSION="4"
 typeset -gr MODEL="gpt-5.6-sol"
+typeset -gr BEDROCK_MODEL="openai.gpt-5.6-sol"
 typeset -gr REASONING_EFFORT="low"
 typeset -gr MEASURED_RUNS=5
 typeset -gr WARMUP_RUNS=1
@@ -38,8 +39,14 @@ typeset -gr PARSE_RUN_FILTER='
   | ([.[] | select(.type == "event_msg" and event_type == "task_complete") | .payload] | last) as $turn
   | ([.[] | select(.type == "event_msg" and event_type == "token_count")
       | .payload.info.last_token_usage? | select(. != null)] | last) as $usage
+  | ([.[] | select(.type == "session_meta") | .payload.model_provider?
+      | select(. != null)] | last) as $model_provider
   | if $turn == null then error("task_complete event missing")
-    elif $usage == null then error("token_count event missing") else null end
+    elif $usage == null then error("token_count event missing")
+    elif $model_provider == null then error("model provider missing")
+    elif $model_provider != $expected_provider then error(
+      "expected provider \($expected_provider), got \($model_provider)"
+    ) else null end
   | ($turn.duration_ms - $turn.time_to_first_token_ms) as $generation_ms
   | ($usage.output_tokens - $usage.reasoning_output_tokens) as $visible_tokens
   | if $generation_ms <= 0 then error("generation duration must be positive")
@@ -56,6 +63,9 @@ typeset ORIGINAL_CODEX_HOME=""
 typeset CODEX_BIN=""
 typeset ISOLATED_ROOT=""
 typeset SERVICE_TIER=""
+typeset MODEL_PROVIDER=""
+typeset AUTHENTICATION=""
+typeset CODEX_RUNTIME_HOME=""
 
 fail() {
   print -u2 -- "Error: $1"
@@ -84,6 +94,59 @@ require_jq() {
     || fail "jq is required. Install it with: brew install jq"
 }
 
+parse_model_provider() {
+  local report=$1
+
+  jq -er '[.. | objects | select(.id? == "config.load")
+    | .details["model provider"]] | first' <<< "$report"
+}
+
+detect_model_provider() {
+  local report
+  local provider
+
+  report=$("$CODEX_BIN" doctor --json 2>/dev/null) || true
+  provider=$(parse_model_provider "$report" 2>/dev/null) \
+    || fail "Could not determine the active model provider."
+  validate_model_provider "$provider"
+}
+
+validate_model_provider() {
+  local provider=$1
+
+  case $provider in
+    openai|amazon-bedrock) print -r -- "$provider" ;;
+    *) fail "Unsupported model provider: $provider" ;;
+  esac
+}
+
+parse_authentication() {
+  local login_status=$1
+
+  case $login_status in
+    *ChatGPT*) print "ChatGPT" ;;
+    *"API key"*) print "API key" ;;
+    *) print "Unknown" ;;
+  esac
+}
+
+detect_authentication() {
+  local provider=$1
+  local login_status
+
+  [[ $provider == amazon-bedrock ]] && { print "AWS"; return 0; }
+  login_status=$("$CODEX_BIN" login status 2>&1) || { print "Unknown"; return 0; }
+  parse_authentication "$login_status"
+}
+
+model_for_provider() {
+  [[ $1 == amazon-bedrock ]] && print "$BEDROCK_MODEL" || print "$MODEL"
+}
+
+provider_name() {
+  [[ $1 == amazon-bedrock ]] && print "Amazon Bedrock" || print "OpenAI"
+}
+
 cleanup() {
   [[ -n "$BENCHMARK_ROOT" && -d "$BENCHMARK_ROOT" ]] || return 0
   local attempt
@@ -98,18 +161,17 @@ cleanup() {
 
 prepare_isolated_home() {
   local isolated_root=$1
+  local provider=$2
 
   mkdir -p "$isolated_root/home" "$isolated_root/codex"
+  [[ $provider == amazon-bedrock ]] && return 0
   cp "$ORIGINAL_CODEX_HOME/auth.json" "$isolated_root/codex/auth.json"
   chmod 600 "$isolated_root/codex/auth.json"
 }
 
 run_isolated_codex() {
-  local isolated_root=$1
-  shift
-
-  HOME="$isolated_root/home" \
-    CODEX_HOME="$isolated_root/codex" \
+  HOME="$CODEX_RUNTIME_HOME" \
+    CODEX_HOME="$ISOLATED_ROOT/codex" \
     "$CODEX_BIN" "$@"
 }
 
@@ -142,12 +204,10 @@ wait_with_timeout() {
 }
 
 verify_isolation() {
-  local isolated_root=$1
-
-  run_isolated_codex "$isolated_root" mcp list "${ISOLATION_FLAGS[@]}" --json \
+  run_isolated_codex mcp list "${ISOLATION_FLAGS[@]}" --json \
     | jq -e 'type == "array" and length == 0' >/dev/null \
     || fail "Could not verify that MCP servers are disabled."
-  run_isolated_codex "$isolated_root" plugin list "${ISOLATION_FLAGS[@]}" --json \
+  run_isolated_codex plugin list "${ISOLATION_FLAGS[@]}" --json \
     | jq -e '(.installed // []) | length == 0' >/dev/null \
     || fail "Could not verify that plugins are disabled."
 }
@@ -172,8 +232,9 @@ discover_skill_config() {
 
 parse_run() {
   local rollout_file=$1
+  local expected_provider=$2
 
-  jq -sce "$PARSE_RUN_FILTER" "$rollout_file"
+  jq -sce --arg expected_provider "$expected_provider" "$PARSE_RUN_FILTER" "$rollout_file"
 }
 
 find_rollout() {
@@ -196,12 +257,18 @@ run_once() {
   local thread_id
   local process_id
   local exit_code=0
+  local model=$(model_for_provider "$MODEL_PROVIDER")
+  local result
+  local -a provider_args=(-c "model_provider=\"$MODEL_PROVIDER\"")
+
+  [[ $MODEL_PROVIDER == openai ]] \
+    && provider_args+=(-c "service_tier=\"$SERVICE_TIER\"")
 
   mkdir "$run_root"
-  run_isolated_codex "$ISOLATED_ROOT" exec --json --ignore-user-config --skip-git-repo-check \
-    --sandbox read-only --color never "${ISOLATION_FLAGS[@]}" -C "$run_root" -m "$MODEL" \
+  run_isolated_codex exec --json --ignore-user-config --skip-git-repo-check \
+    --sandbox read-only --color never "${ISOLATION_FLAGS[@]}" -C "$run_root" -m "$model" \
     -c "$skill_config" \
-    -c "model_reasoning_effort=\"$REASONING_EFFORT\"" -c "service_tier=\"$SERVICE_TIER\"" \
+    -c "model_reasoning_effort=\"$REASONING_EFFORT\"" "${provider_args[@]}" \
     "$PROMPT" > "$public_events" 2> "$error_log" &
   process_id=$!
   wait_with_timeout "$process_id" "$RUN_TIMEOUT_SECONDS" || exit_code=$?
@@ -213,7 +280,9 @@ run_once() {
   thread_id=$(jq -sr '[.[] | select(.type == "thread.started") | .thread_id] | last // empty' "$public_events")
   [[ -n "$thread_id" ]] || fail "Codex did not report a thread ID on run $run_number."
   rollout_file=$(find_rollout "$ISOLATED_ROOT" "$thread_id") || return 1
-  parse_run "$rollout_file" || fail "Run $run_number did not produce a valid isolated benchmark result."
+  result=$(parse_run "$rollout_file" "$MODEL_PROVIDER") \
+    || fail "Run $run_number did not produce a valid isolated benchmark result."
+  print -r -- "$result"
 }
 
 run_with_retry() {
@@ -238,8 +307,8 @@ run_with_retry() {
 prepare_benchmark_environment() {
   local total_runs=$(( WARMUP_RUNS + MEASURED_RUNS ))
 
-  prepare_isolated_home "$ISOLATED_ROOT"
-  verify_isolation "$ISOLATED_ROOT"
+  prepare_isolated_home "$ISOLATED_ROOT" "$MODEL_PROVIDER"
+  verify_isolation
   print -u2 -- "Running 1/$total_runs (warm-up)..."
   run_with_retry 1 'skills.config=[]' >/dev/null
   discover_skill_config
@@ -271,15 +340,18 @@ print_run_table() {
 print_header() {
   local codex_version=$1
   local jq_version=$2
+  local model=$(model_for_provider "$MODEL_PROVIDER")
 
   print "Codex Speed Benchmark v$BENCHMARK_VERSION"
   print "Date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   print "Isolation: MCP / Skills / Plugins / AGENTS disabled"
   print "Codex CLI: $codex_version"
   print "jq: $jq_version"
-  print "Model: $MODEL"
+  print "Provider: $(provider_name "$MODEL_PROVIDER")"
+  print "Authentication: $AUTHENTICATION"
+  print "Model: $model"
   print "Reasoning: $REASONING_EFFORT"
-  print "Requested service tier: $SERVICE_TIER"
+  [[ $MODEL_PROVIDER == openai ]] && print "Requested service tier: $SERVICE_TIER"
   print "Runs: $MEASURED_RUNS (+ $WARMUP_RUNS warm-up)"
 }
 
@@ -313,9 +385,14 @@ initialize() {
   require_jq
   CODEX_BIN=$(command -v codex)
   ORIGINAL_CODEX_HOME=${CODEX_HOME:-$HOME/.codex}
-  [[ -r "$ORIGINAL_CODEX_HOME/auth.json" ]] || fail "Codex authentication was not found. Run: codex login"
+  MODEL_PROVIDER=$(detect_model_provider)
+  AUTHENTICATION=$(detect_authentication "$MODEL_PROVIDER")
+  [[ $MODEL_PROVIDER == amazon-bedrock || -r "$ORIGINAL_CODEX_HOME/auth.json" ]] \
+    || fail "Codex authentication was not found. Run: codex login"
   BENCHMARK_ROOT=$(mktemp -d /tmp/codex-speed-benchmark.XXXXXX)
   ISOLATED_ROOT="$BENCHMARK_ROOT/environment"
+  CODEX_RUNTIME_HOME="$ISOLATED_ROOT/home"
+  [[ $MODEL_PROVIDER == amazon-bedrock ]] && CODEX_RUNTIME_HOME=$HOME
   trap cleanup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -336,7 +413,7 @@ execute_benchmark() {
     print -r -- "$result" >> "$results_file"
   done
 
-  verify_isolation "$ISOLATED_ROOT"
+  verify_isolation
   local summary=$(median_summary "$results_file")
   print_summary "$results_file" "$summary"
 }

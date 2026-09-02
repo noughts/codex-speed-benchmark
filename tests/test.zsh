@@ -29,15 +29,39 @@ assert_json_field() {
 }
 
 test_parse_run() {
-  local result=$(parse_run "$TEST_ROOT/fixtures/success.jsonl")
+  local result=$(parse_run "$TEST_ROOT/fixtures/success.jsonl" openai)
 
   assert_json_field "50" "total_tps" "$result"
   assert_json_field "40" "visible_tps" "$result"
   assert_json_field "2000" "ttft_ms" "$result"
+  ! parse_run "$TEST_ROOT/fixtures/success.jsonl" amazon-bedrock >/dev/null 2>&1 \
+    || fail "provider mismatch should be rejected"
+}
+
+test_model_provider() {
+  local report='{"checks":{"config.load":{"id":"config.load","details":{"model provider":"amazon-bedrock"}}}}'
+
+  assert_equal "amazon-bedrock" "$(parse_model_provider "$report")" "model provider"
+  assert_equal "gpt-5.6-sol" "$(model_for_provider openai)" "OpenAI model"
+  assert_equal "openai.gpt-5.6-sol" "$(model_for_provider amazon-bedrock)" "Bedrock model"
+  assert_equal "OpenAI" "$(provider_name openai)" "OpenAI provider name"
+  assert_equal "Amazon Bedrock" "$(provider_name amazon-bedrock)" "Bedrock provider name"
+  assert_equal "openai" "$(validate_model_provider openai)" "supported provider"
+  ! validate_model_provider custom >/dev/null 2>&1 || fail "custom provider should be rejected"
+}
+
+test_authentication() {
+  assert_equal "ChatGPT" "$(parse_authentication 'Logged in using ChatGPT')" "ChatGPT auth"
+  assert_equal "API key" \
+    "$(parse_authentication 'Logged in using an API key - sk-proj-***abcd')" "API key auth"
+  assert_equal "Unknown" "$(parse_authentication 'Logged in another way')" "unknown auth"
+  assert_equal "AWS" "$(detect_authentication amazon-bedrock)" "Bedrock auth"
+  [[ "$(parse_authentication 'Logged in using an API key - sk-proj-***abcd')" != *abcd* ]] \
+    || fail "authentication output should not contain API key fragments"
 }
 
 test_tool_rejection() {
-  if parse_run "$TEST_ROOT/fixtures/tool-call.jsonl" >/dev/null 2>&1; then
+  if parse_run "$TEST_ROOT/fixtures/tool-call.jsonl" openai >/dev/null 2>&1; then
     fail "tool call fixture should have been rejected"
   fi
 }
@@ -110,6 +134,8 @@ test_median() {
 }
 
 test_parse_run
+test_model_provider
+test_authentication
 test_tool_rejection
 test_missing_jq_message
 test_service_tier
