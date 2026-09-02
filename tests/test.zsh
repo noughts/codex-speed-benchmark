@@ -42,6 +42,61 @@ test_tool_rejection() {
   fi
 }
 
+test_missing_jq_message() {
+  local message
+
+  message=$(PATH=/nonexistent require_jq 2>&1) && fail "missing jq should have failed"
+  [[ "$message" == *"brew install jq"* ]] || fail "missing jq message should include installation command"
+}
+
+test_service_tier() {
+  assert_equal "default" "$(parse_service_tier)" "default service tier"
+  assert_equal "default" "$(parse_service_tier default)" "explicit default service tier"
+  assert_equal "fast" "$(parse_service_tier fast)" "fast service tier"
+  ! parse_service_tier slow >/dev/null 2>&1 || fail "invalid service tier should fail"
+  ! parse_service_tier default fast >/dev/null 2>&1 || fail "extra arguments should fail"
+}
+
+test_sh_reexec() {
+  local message
+
+  message=$(PATH=/nonexistent /bin/sh "$TEST_ROOT/../benchmark.zsh" fast 2>&1) \
+    && fail "benchmark should fail without codex"
+  [[ "$message" == *"Required command 'codex'"* ]] \
+    || fail "sh should re-execute the benchmark with zsh"
+
+  message=$(/bin/sh "$TEST_ROOT/../benchmark.zsh" invalid 2>&1) \
+    && fail "sh should preserve an invalid service tier argument"
+  [[ "$message" == *"Usage:"* ]] || fail "sh should preserve benchmark arguments"
+}
+
+test_timeout() {
+  local exit_code=0
+
+  sleep 2 &
+  local process_id=$!
+  wait_with_timeout "$process_id" 0 || exit_code=$?
+  assert_equal "124" "$exit_code" "timeout exit code"
+  ! kill -0 "$process_id" 2>/dev/null || fail "timed out process should be stopped"
+}
+
+test_skill_config() {
+  local config=$(build_skill_config imagegen openai-docs)
+
+  assert_equal 'skills.config=[{name="imagegen",enabled=false},{name="openai-docs",enabled=false}]' \
+    "$config" "skill config"
+}
+
+test_timeout_retry() {
+  run_once() {
+    (( $2 == 1 )) && return 124
+    print '{"retried":true}'
+  }
+
+  local result=$(run_with_retry 1 'skills.config=[]' 2>/dev/null)
+  assert_json_field "true" "retried" "$result"
+}
+
 test_median() {
   TEST_TEMP=$(mktemp /tmp/codex-speed-results.XXXXXX)
   print '{"total_tps":30,"visible_tps":20,"ttft_ms":3000}' >> "$TEST_TEMP"
@@ -56,5 +111,11 @@ test_median() {
 
 test_parse_run
 test_tool_rejection
+test_missing_jq_message
+test_service_tier
+test_sh_reexec
+test_timeout
+test_skill_config
 test_median
+test_timeout_retry
 print "All tests passed."
