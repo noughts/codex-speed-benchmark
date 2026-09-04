@@ -11,16 +11,20 @@ A small macOS benchmark for comparing Codex text-generation speed under isolated
 
 ```console
 ./benchmark.zsh
-./benchmark.zsh fast
+./benchmark.zsh --service-tier fast
+./benchmark.zsh --model gpt-5.6-sol
+./benchmark.zsh --model gpt-5.6-sol --service-tier fast
 ```
 
 Running `sh benchmark.zsh` is also supported; the script automatically re-executes itself with macOS's `/bin/zsh`.
 
-For OpenAI runs, the optional service tier is `default` or `fast`; omitting it uses `default`. This is the requested tier because Codex CLI does not expose the tier that actually served the response. Amazon Bedrock runs do not send a service tier.
+For OpenAI runs, `--service-tier` accepts `default` or `fast`; omitting it uses `default`. This is the requested tier because Codex CLI does not expose the tier that actually served the response. Amazon Bedrock runs do not send a service tier, even when specified. The former positional arguments `fast` and `default` are no longer supported.
+
+Use `--model <ID>` to select a model. The ID is passed unchanged to Codex; for Amazon Bedrock, include the provider prefix, for example `./benchmark.zsh --model openai.gpt-5.6-sol`. Without `--model`, OpenAI uses `gpt-5.6-sol` and Amazon Bedrock uses `openai.gpt-5.6-sol`. Options may appear in either order and each may be specified once. Use a space between each option and its value; short options and `--option=value` are not supported.
 
 The summary header records the host so pasted results are comparable: chip, hardware model, core count, memory, and the macOS version and build. Local hardware has little effect on generation speed, which is measured server-side, but it distinguishes runs on different machines and networks. The hostname is deliberately not reported.
 
-The benchmark makes one warm-up request and five measured requests using GPT-5.6 Sol and low reasoning. It detects whether Codex is configured to use OpenAI or Amazon Bedrock and reports the provider and authentication type. OpenAI runs report ChatGPT or API key authentication without exposing key fragments; Bedrock runs report AWS authentication.
+The benchmark makes one warm-up request and five measured requests using the selected model and low reasoning. Model compatibility errors, including unsupported low reasoning, are reported by Codex. It detects whether Codex is configured to use OpenAI or Amazon Bedrock and reports the provider and authentication type. OpenAI runs report ChatGPT or API key authentication without exposing key fragments; Bedrock runs report AWS authentication.
 
 Codex runs with isolated temporary state, every discovered system skill disabled, and no personal MCP servers or plugins installed. Bedrock runs retain access to the standard AWS credential chain. Each run has a 120-second timeout and one retry for transient timeouts. Temporary authentication and response data are deleted on exit.
 

@@ -63,6 +63,7 @@ typeset ORIGINAL_CODEX_HOME=""
 typeset CODEX_BIN=""
 typeset ISOLATED_ROOT=""
 typeset SERVICE_TIER=""
+typeset REQUESTED_MODEL=""
 typeset MODEL_PROVIDER=""
 typeset AUTHENTICATION=""
 typeset CODEX_RUNTIME_HOME=""
@@ -74,17 +75,30 @@ fail() {
   return 1
 }
 
-parse_service_tier() {
-  if (( $# > 1 )); then
-    fail "Usage: $0 [default|fast]"
-    return 1
-  fi
-  local tier=${1:-default}
+usage_error() {
+  fail "Usage: $0 [--model <ID>] [--service-tier <default|fast>]"
+}
 
-  case $tier in
-    default|fast) print -r -- "$tier" ;;
-    *) fail "Usage: $0 [default|fast]" ;;
+parse_option_pairs() {
+  local tier=$1 model=$2
+  shift 2
+  (( $# )) || { print -rl -- "${tier:-default}" "$model"; return 0; }
+  (( $# >= 2 )) && [[ -n $2 && $2 != -* ]] || { usage_error; return 1; }
+  case $1 in
+    --model)
+      [[ -z $model ]] || { usage_error; return 1; }
+      parse_option_pairs "$tier" "$2" "${@:3}"
+      ;;
+    --service-tier)
+      [[ -z $tier && ( $2 == default || $2 == fast ) ]] || { usage_error; return 1; }
+      parse_option_pairs "$2" "$model" "${@:3}"
+      ;;
+    *) usage_error ;;
   esac
+}
+
+parse_options() {
+  parse_option_pairs '' '' "$@"
 }
 
 require_command() {
@@ -190,6 +204,7 @@ detect_bedrock_config_args() {
 }
 
 model_for_provider() {
+  [[ -n ${2:-} ]] && { print -r -- "$2"; return 0; }
   [[ $1 == amazon-bedrock ]] && print "$BEDROCK_MODEL" || print "$MODEL"
 }
 
@@ -339,7 +354,7 @@ run_once() {
   local thread_id
   local process_id
   local exit_code=0
-  local model=$(model_for_provider "$MODEL_PROVIDER")
+  local model=$(model_for_provider "$MODEL_PROVIDER" "$REQUESTED_MODEL")
   local result
   local -a provider_args=(-c "model_provider=\"$MODEL_PROVIDER\"")
 
@@ -439,7 +454,7 @@ print_run_table() {
 print_header() {
   local codex_version=$1
   local jq_version=$2
-  local model=$(model_for_provider "$MODEL_PROVIDER")
+  local model=$(model_for_provider "$MODEL_PROVIDER" "$REQUESTED_MODEL")
 
   print "Codex Speed Benchmark v$BENCHMARK_VERSION"
   print "Date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -482,7 +497,10 @@ print_summary() {
 initialize() {
   setopt errexit nounset pipefail extendedglob
   umask 077
-  SERVICE_TIER=$(parse_service_tier "$@")
+  local -a options
+  options=("${(@f)$(parse_options "$@")}") || return 1
+  SERVICE_TIER=$options[1]
+  REQUESTED_MODEL=${options[2]:-}
   require_command codex
   require_jq
   CODEX_BIN=$(command -v codex)

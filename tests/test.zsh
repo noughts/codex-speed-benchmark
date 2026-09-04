@@ -44,6 +44,9 @@ test_model_provider() {
   assert_equal "amazon-bedrock" "$(parse_model_provider "$report")" "model provider"
   assert_equal "gpt-5.6-sol" "$(model_for_provider openai)" "OpenAI model"
   assert_equal "openai.gpt-5.6-sol" "$(model_for_provider amazon-bedrock)" "Bedrock model"
+  assert_equal "custom-model" "$(model_for_provider openai custom-model)" "requested OpenAI model"
+  assert_equal "openai.custom-model" "$(model_for_provider amazon-bedrock openai.custom-model)" "requested Bedrock model"
+  assert_equal "custom-model" "$(model_for_provider amazon-bedrock custom-model)" "model ID is unchanged"
   assert_equal "OpenAI" "$(provider_name openai)" "OpenAI provider name"
   assert_equal "Amazon Bedrock" "$(provider_name amazon-bedrock)" "Bedrock provider name"
   assert_equal "openai" "$(validate_model_provider openai)" "supported provider"
@@ -97,18 +100,46 @@ test_missing_jq_message() {
   [[ "$message" == *"brew install jq"* ]] || fail "missing jq message should include installation command"
 }
 
-test_service_tier() {
-  assert_equal "default" "$(parse_service_tier)" "default service tier"
-  assert_equal "default" "$(parse_service_tier default)" "explicit default service tier"
-  assert_equal "fast" "$(parse_service_tier fast)" "fast service tier"
-  ! parse_service_tier slow >/dev/null 2>&1 || fail "invalid service tier should fail"
-  ! parse_service_tier default fast >/dev/null 2>&1 || fail "extra arguments should fail"
+assert_invalid_options() {
+  local message
+
+  message=$(/bin/zsh "$TEST_ROOT/../benchmark.zsh" "$@" 2>&1) \
+    && { fail "invalid options should fail: $*"; return 1; }
+  [[ "$message" == *"Usage:"* ]] || fail "invalid options should display usage: $*"
+}
+
+test_options() {
+  assert_equal "default" "$(parse_options)" "default options"
+  assert_equal "default" "$(parse_options --service-tier default)" "explicit default tier"
+  assert_equal "fast" "$(parse_options --service-tier fast)" "fast tier"
+  assert_equal $'default\ncustom-model' "$(parse_options --model custom-model)" "model only"
+  assert_equal $'fast\ncustom-model' \
+    "$(parse_options --model custom-model --service-tier fast)" "model then tier"
+  assert_equal $'fast\ncustom-model' \
+    "$(parse_options --service-tier fast --model custom-model)" "tier then model"
+}
+
+test_invalid_options() {
+  assert_invalid_options fast
+  assert_invalid_options default
+  assert_invalid_options --unknown value
+  assert_invalid_options --model
+  assert_invalid_options --model ''
+  assert_invalid_options --model --service-tier fast
+  assert_invalid_options --model=-example
+  assert_invalid_options --model -example
+  assert_invalid_options --service-tier
+  assert_invalid_options --service-tier ''
+  assert_invalid_options --service-tier slow
+  assert_invalid_options --service-tier default --service-tier fast
+  assert_invalid_options --model first --model second
+  assert_invalid_options --model example extra
 }
 
 test_sh_reexec() {
   local message
 
-  message=$(PATH=/nonexistent /bin/sh "$TEST_ROOT/../benchmark.zsh" fast 2>&1) \
+  message=$(PATH=/nonexistent /bin/sh "$TEST_ROOT/../benchmark.zsh" --model custom-model --service-tier fast 2>&1) \
     && fail "benchmark should fail without codex"
   [[ "$message" == *"Required command 'codex'"* ]] \
     || fail "sh should re-execute the benchmark with zsh"
@@ -164,7 +195,8 @@ test_host_metadata
 test_authentication
 test_tool_rejection
 test_missing_jq_message
-test_service_tier
+test_options
+test_invalid_options
 test_sh_reexec
 test_timeout
 test_skill_config
