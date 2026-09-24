@@ -8,7 +8,8 @@ if [ -z "${ZSH_VERSION:-}" ]; then
   exec /bin/zsh "$0" "$@"
 fi
 
-typeset -gr BENCHMARK_VERSION="5"
+typeset -gr BENCHMARK_VERSION="6"
+typeset -gr SCRIPT_ROOT=${${(%):-%x}:A:h}
 typeset -gr MODEL="gpt-5.6-sol"
 typeset -gr BEDROCK_MODEL="openai.gpt-5.6-sol"
 typeset -gr REASONING_EFFORT="low"
@@ -61,6 +62,10 @@ typeset -gr PARSE_RUN_FILTER='
 typeset BENCHMARK_ROOT=""
 typeset ORIGINAL_CODEX_HOME=""
 typeset CODEX_BIN=""
+typeset BENCHMARK_CLI="codex"
+typeset CLAUDE_BIN=""
+typeset CLAUDE_SECURE_STORAGE=""
+typeset CLI_VERSION=""
 typeset ISOLATED_ROOT=""
 typeset SERVICE_TIER=""
 typeset REQUESTED_MODEL=""
@@ -76,29 +81,37 @@ fail() {
 }
 
 usage_error() {
-  fail "Usage: $0 [--model <ID>] [--service-tier <default|fast>]"
+  fail "Usage: $0 [--cli <codex|claude>] [--model <ID>] [--service-tier <default|fast>] (Claude requires --model)"
 }
 
 parse_option_pairs() {
-  local tier=$1 model=$2
-  shift 2
-  (( $# )) || { print -rl -- "${tier:-default}" "$model"; return 0; }
+  local tier=$1 model=$2 cli=$3
+  shift 3
+  if (( $# == 0 )); then
+    [[ $cli != claude || -n $model ]] || { usage_error; return 1; }
+    print -rl -- "${cli:-codex}" "${tier:-default}" "$model"
+    return 0
+  fi
   (( $# >= 2 )) && [[ -n $2 && $2 != -* ]] || { usage_error; return 1; }
   case $1 in
     --model)
       [[ -z $model ]] || { usage_error; return 1; }
-      parse_option_pairs "$tier" "$2" "${@:3}"
+      parse_option_pairs "$tier" "$2" "$cli" "${@:3}"
       ;;
     --service-tier)
       [[ -z $tier && ( $2 == default || $2 == fast ) ]] || { usage_error; return 1; }
-      parse_option_pairs "$2" "$model" "${@:3}"
+      parse_option_pairs "$2" "$model" "$cli" "${@:3}"
+      ;;
+    --cli)
+      [[ -z $cli && ( $2 == codex || $2 == claude ) ]] || { usage_error; return 1; }
+      parse_option_pairs "$tier" "$model" "$2" "${@:3}"
       ;;
     *) usage_error ;;
   esac
 }
 
 parse_options() {
-  parse_option_pairs '' '' "$@"
+  parse_option_pairs '' '' '' "$@"
 }
 
 require_command() {
@@ -246,7 +259,11 @@ detect_macos() {
 
 cleanup() {
   [[ -n "$BENCHMARK_ROOT" && -d "$BENCHMARK_ROOT" ]] || return 0
-  local attempt
+  local attempt pid_file
+
+  for pid_file in "$BENCHMARK_ROOT"/run-*/process.pid(N); do
+    terminate_process "$(<"$pid_file")"
+  done
 
   for attempt in {1..3}; do
     find "$BENCHMARK_ROOT" -depth -delete 2>/dev/null
@@ -266,10 +283,74 @@ prepare_isolated_home() {
   chmod 600 "$isolated_root/codex/auth.json"
 }
 
+# Call these launchers only in a background job, pipeline, or command substitution.
+# exec then makes the tracked PID the CLI itself, without an extra shell child.
 run_isolated_codex() {
-  HOME="$CODEX_RUNTIME_HOME" \
-    CODEX_HOME="$ISOLATED_ROOT/codex" \
-    "$CODEX_BIN" "$@"
+  export HOME="$CODEX_RUNTIME_HOME" \
+    CODEX_HOME="$ISOLATED_ROOT/codex"
+  exec "$CODEX_BIN" "$@"
+}
+
+run_isolated_claude() {
+  cd "$1" || return 1
+  shift
+  export CLAUDE_CONFIG_DIR="$ISOLATED_ROOT/claude" \
+    CLAUDE_SECURESTORAGE_CONFIG_DIR="$CLAUDE_SECURE_STORAGE" \
+    CLAUDE_CODE_EFFORT_LEVEL="$REASONING_EFFORT" MAX_THINKING_TOKENS=0
+  exec "$CLAUDE_BIN" --safe-mode --setting-sources '' "$@"
+}
+
+validate_claude_version() {
+  autoload -Uz is-at-least
+  local version=${1%% *}
+  [[ $version == <->.<->.<-> ]] && is-at-least 2.1.281 "$version" \
+    || fail "Claude Code 2.1.281 or later is required. Run: claude update"
+}
+
+validate_claude_authentication() {
+  jq -e '.loggedIn == true and .authMethod == "claude.ai" and .apiProvider == "firstParty"' \
+    >/dev/null <<< "$1" || fail "Claude requires a direct Claude account login. Run: claude auth login"
+}
+
+parse_claude_run() {
+  jq -sce --arg tier "$2" --arg requested_model "$3" \
+    -f "$SCRIPT_ROOT/claude-run.jq" "$1"
+}
+
+run_claude_once() {
+  local run_number=$1 attempt=$2
+  local run_root="$BENCHMARK_ROOT/run-$run_number-attempt-$attempt"
+  local exit_code=0 process_id result
+  local settings=$(jq -cn --arg tier "$SERVICE_TIER" \
+    '{alwaysThinkingEnabled:false, fastMode:($tier == "fast"), disableAllHooks:true}')
+
+  mkdir "$run_root" || return 1
+  run_isolated_claude "$run_root" -p --tools '' --strict-mcp-config \
+    --mcp-config '{"mcpServers":{}}' --disable-slash-commands --no-session-persistence \
+    --output-format stream-json --verbose --include-partial-messages \
+    --model "$REQUESTED_MODEL" --effort "$REASONING_EFFORT" --settings "$settings" "$PROMPT" \
+    > "$run_root/events.jsonl" 2> "$run_root/claude.stderr" &
+  process_id=$!
+  print -r -- "$process_id" > "$run_root/process.pid"
+  wait_with_timeout "$process_id" "$RUN_TIMEOUT_SECONDS" || exit_code=$?
+  rm -f "$run_root/process.pid"
+  if (( exit_code == 124 )); then
+    print -u2 -- "Claude timed out after $RUN_TIMEOUT_SECONDS seconds on run $run_number."
+    return 124
+  fi
+  (( exit_code == 0 )) || {
+    local error_message
+    error_message=$(jq -sr '[.[] | select(.type == "result" and .is_error == true)
+      | (.errors[]?, .result?)] | map(select(type == "string")) | join("\n")' \
+      "$run_root/events.jsonl" 2>/dev/null) || error_message="No valid error event."
+    fail "Claude failed on run $run_number (exit $exit_code).\n$error_message\n$(<"$run_root/claude.stderr")"
+    return 1
+  }
+  result=$(parse_claude_run "$run_root/events.jsonl" "$SERVICE_TIER" "$REQUESTED_MODEL") || {
+    fail "Run $run_number did not produce a valid isolated Claude benchmark result."
+    return 1
+  }
+  print -r -- "$result"
 }
 
 terminate_process() {
@@ -301,6 +382,8 @@ wait_with_timeout() {
 }
 
 verify_isolation() {
+  # Claude isolation is verified from every run's init and response events.
+  [[ $BENCHMARK_CLI == claude ]] && return 0
   run_isolated_codex mcp list "${ISOLATION_FLAGS[@]}" --json \
     | jq -e 'type == "array" and length == 0' >/dev/null \
     || fail "Could not verify that MCP servers are disabled."
@@ -344,6 +427,10 @@ find_rollout() {
 }
 
 run_once() {
+  if [[ $BENCHMARK_CLI == claude ]]; then
+    run_claude_once "$1" "$2"
+    return $?
+  fi
   local run_number=$1
   local attempt=$2
   local skill_config=$3
@@ -371,7 +458,9 @@ run_once() {
     -c "model_reasoning_effort=\"$REASONING_EFFORT\"" "${provider_args[@]}" \
     "$PROMPT" > "$public_events" 2> "$error_log" &
   process_id=$!
+  print -r -- "$process_id" > "$run_root/process.pid"
   wait_with_timeout "$process_id" "$RUN_TIMEOUT_SECONDS" || exit_code=$?
+  rm -f "$run_root/process.pid"
   if (( exit_code == 124 )); then
     print -u2 -- "Codex timed out after $RUN_TIMEOUT_SECONDS seconds on run $run_number."
     return 124
@@ -400,14 +489,14 @@ run_with_retry() {
   local run_number=$1
   local skill_config=$2
   local attempt
-  local result
   local exit_code
 
   for attempt in {1..$MAX_ATTEMPTS_PER_RUN}; do
     exit_code=0
-    result=$(run_once "$run_number" "$attempt" "$skill_config") || exit_code=$?
+    # Keep the long-running wait in the parent shell so signal traps run promptly.
+    # run_once writes stdout only after validating a complete result.
+    run_once "$run_number" "$attempt" "$skill_config" || exit_code=$?
     if (( exit_code == 0 )); then
-      print -r -- "$result"
       return 0
     elif (( exit_code != 124 )); then
       return 1
@@ -421,10 +510,13 @@ run_with_retry() {
 prepare_benchmark_environment() {
   local total_runs=$(( WARMUP_RUNS + MEASURED_RUNS ))
 
-  prepare_isolated_home "$ISOLATED_ROOT" "$MODEL_PROVIDER"
+  if [[ $BENCHMARK_CLI == codex ]]; then
+    prepare_isolated_home "$ISOLATED_ROOT" "$MODEL_PROVIDER"
+  fi
   verify_isolation
   print -u2 -- "Running 1/$total_runs (warm-up)..."
   run_with_retry 1 'skills.config=[]' >/dev/null
+  [[ $BENCHMARK_CLI == claude ]] && { print ''; return 0; }
   discover_skill_config
 }
 
@@ -432,7 +524,9 @@ median_summary() {
   local results_file=$1
 
   jq -sce '
-    def median($field): map(.[$field]) | sort | .[length / 2 | floor];
+    def median($field):
+      if any(.[]; .[$field] == null) then null
+      else map(.[$field]) | sort | .[length / 2 | floor] end;
     {
       total_tps: median("total_tps"),
       visible_tps: median("visible_tps"),
@@ -445,28 +539,41 @@ print_run_table() {
   local results_file=$1
 
   print "Run   Total TPS   Visible TPS   TTFT"
-  jq -sr 'to_entries[] | [.key + 1, .value.total_tps, .value.visible_tps, .value.ttft_ms] | @tsv' "$results_file" \
+  jq -sr 'to_entries[] | [.key + 1, .value.total_tps, (.value.visible_tps // "N/A"), .value.ttft_ms] | @tsv' "$results_file" \
     | while IFS=$'\t' read -r run total visible ttft; do
-        printf '%-4d %10.2f %13.2f %6.2fs\n' "$run" "$total" "$visible" "$(( ttft / 1000.0 ))"
+        [[ $visible == N/A ]] || printf -v visible '%.2f' "$visible"
+        printf '%-4d %10.2f %13s %6.2fs\n' "$run" "$total" "$visible" "$(( ttft / 1000.0 ))"
       done
 }
 
 print_header() {
-  local codex_version=$1
+  local cli_version=$1
   local jq_version=$2
   local model=$(model_for_provider "$MODEL_PROVIDER" "$REQUESTED_MODEL")
 
-  print "Codex Speed Benchmark v$BENCHMARK_VERSION"
+  [[ $BENCHMARK_CLI == claude ]] && print "Claude Code Speed Benchmark v$BENCHMARK_VERSION" \
+    || print "Codex Speed Benchmark v$BENCHMARK_VERSION"
   print "Date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   print "Host: $(detect_host)"
   print "macOS: $(detect_macos)"
-  print "Isolation: MCP / Skills / Plugins / AGENTS disabled"
-  print "Codex CLI: $codex_version"
+  if [[ $BENCHMARK_CLI == claude ]]; then
+    print "Isolation: tools / MCP / skills / custom plugins / instructions disabled; built-ins recorded below"
+    print "Claude Code CLI: $cli_version"
+  else
+    print "Isolation: MCP / Skills / Plugins / AGENTS disabled"
+    print "Codex CLI: $cli_version"
+  fi
   print "jq: $jq_version"
-  print "Provider: $(provider_name "$MODEL_PROVIDER")"
+  [[ $BENCHMARK_CLI == claude ]] && print "Provider: Anthropic" \
+    || print "Provider: $(provider_name "$MODEL_PROVIDER")"
   print "Authentication: $AUTHENTICATION"
   print "Model: $model"
   print "Reasoning: $REASONING_EFFORT"
+  if [[ $BENCHMARK_CLI == claude ]]; then
+    print "Thinking: disabled when supported; model-required adaptive thinking allowed"
+    print "Requested service tier: $SERVICE_TIER"
+    print "Timing: CLI-reported streaming TTFT; TPS over duration_ms - ttft_stream_ms"
+  fi
   [[ $MODEL_PROVIDER == openai ]] && print "Requested service tier: $SERVICE_TIER"
   [[ $MODEL_PROVIDER == amazon-bedrock ]] && print "AWS region: $AWS_BENCHMARK_REGION"
   print "Runs: $MEASURED_RUNS (+ $WARMUP_RUNS warm-up)"
@@ -477,9 +584,10 @@ print_medians() {
   local total visible ttft
 
   IFS=$'\t' read -r total visible ttft \
-    <<< "$(jq -r '[.total_tps, .visible_tps, (.ttft_ms / 1000)] | @tsv' <<< "$summary")"
+    <<< "$(jq -r '[.total_tps, (.visible_tps // "N/A"), (.ttft_ms / 1000)] | @tsv' <<< "$summary")"
   printf 'Median Total TPS:   %.2f\n' "$total"
-  printf 'Median Visible TPS: %.2f\n' "$visible"
+  [[ $visible == N/A ]] || printf -v visible '%.2f' "$visible"
+  printf 'Median Visible TPS: %s\n' "$visible"
   printf 'Median TTFT:        %.2fs\n' "$ttft"
 }
 
@@ -487,7 +595,10 @@ print_summary() {
   local results_file=$1
   local summary=$2
 
-  print_header "$($CODEX_BIN --version)" "$(jq --version)"
+  print_header "$CLI_VERSION" "$(jq --version)"
+  if [[ $BENCHMARK_CLI == claude ]]; then
+    jq -sr '.[0] | "Actual model: \(.model)\nActual speed: \(.speed)\nBuilt-in plugins: \(.builtin_plugins | join(", "))"' "$results_file"
+  fi
   print
   print_run_table "$results_file"
   print
@@ -499,11 +610,29 @@ initialize() {
   umask 077
   local -a options
   options=("${(@f)$(parse_options "$@")}") || return 1
-  SERVICE_TIER=$options[1]
-  REQUESTED_MODEL=${options[2]:-}
-  require_command codex
+  BENCHMARK_CLI=$options[1]
+  SERVICE_TIER=$options[2]
+  REQUESTED_MODEL=${options[3]:-}
+  require_command "$BENCHMARK_CLI"
   require_jq
+  if [[ $BENCHMARK_CLI == claude ]]; then
+    CLAUDE_BIN=$(command -v claude)
+    CLI_VERSION=$("$CLAUDE_BIN" --version)
+    validate_claude_version "$CLI_VERSION"
+    CLAUDE_SECURE_STORAGE=${CLAUDE_SECURESTORAGE_CONFIG_DIR-${CLAUDE_CONFIG_DIR-}}
+    BENCHMARK_ROOT=$(mktemp -d /tmp/claude-speed-benchmark.XXXXXX)
+    ISOLATED_ROOT="$BENCHMARK_ROOT/environment"
+    mkdir -p "$ISOLATED_ROOT/claude"
+    local login_status
+    login_status=$(run_isolated_claude "$BENCHMARK_ROOT" auth status --json) \
+      || { fail "Claude authentication unavailable. Run: claude auth login"; return 1; }
+    validate_claude_authentication "$login_status"
+    MODEL_PROVIDER=anthropic
+    AUTHENTICATION="Claude account"
+    return 0
+  fi
   CODEX_BIN=$(command -v codex)
+  CLI_VERSION=$("$CODEX_BIN" --version)
   ORIGINAL_CODEX_HOME=${CODEX_HOME:-$HOME/.codex}
   MODEL_PROVIDER=$(detect_model_provider)
   AUTHENTICATION=$(detect_authentication "$MODEL_PROVIDER")
@@ -520,15 +649,14 @@ initialize() {
 execute_benchmark() {
   local results_file="$BENCHMARK_ROOT/results.jsonl"
   local total_runs=$(( WARMUP_RUNS + MEASURED_RUNS ))
-  local result
   local run_number
   local skill_config
 
-  skill_config=$(prepare_benchmark_environment)
+  prepare_benchmark_environment > "$BENCHMARK_ROOT/skill-config"
+  skill_config=$(<"$BENCHMARK_ROOT/skill-config")
   for (( run_number = WARMUP_RUNS + 1; run_number <= total_runs; run_number++ )); do
     print -u2 -- "Running $run_number/$total_runs..."
-    result=$(run_with_retry "$run_number" "$skill_config")
-    print -r -- "$result" >> "$results_file"
+    run_with_retry "$run_number" "$skill_config" >> "$results_file"
   done
 
   verify_isolation
@@ -538,6 +666,10 @@ execute_benchmark() {
   fi
   (( recorded == MEASURED_RUNS )) \
     || fail "Expected $MEASURED_RUNS measured results but recorded $recorded."
+  if [[ $BENCHMARK_CLI == claude ]]; then
+    jq -se 'map({model, speed, builtin_plugins}) | unique | length == 1' "$results_file" >/dev/null \
+      || fail "Claude model, speed, or built-in plugins changed between measured runs."
+  fi
   local summary=$(median_summary "$results_file")
   print_summary "$results_file" "$summary"
 }
