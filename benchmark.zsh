@@ -8,7 +8,7 @@ if [ -z "${ZSH_VERSION:-}" ]; then
   exec /bin/zsh "$0" "$@"
 fi
 
-typeset -gr BENCHMARK_VERSION="6"
+typeset -gr BENCHMARK_VERSION="7"
 typeset -gr SCRIPT_ROOT=${${(%):-%x}:A:h}
 typeset -gr MODEL="gpt-5.6-sol"
 typeset -gr BEDROCK_MODEL="openai.gpt-5.6-sol"
@@ -222,7 +222,11 @@ model_for_provider() {
 }
 
 provider_name() {
-  [[ $1 == amazon-bedrock ]] && print "Amazon Bedrock" || print "OpenAI"
+  case $1 in
+    amazon-bedrock) print "Amazon Bedrock" ;;
+    anthropic) print "Anthropic" ;;
+    *) print "OpenAI" ;;
+  esac
 }
 
 format_host() {
@@ -307,13 +311,15 @@ validate_claude_version() {
     || fail "Claude Code 2.1.281 or later is required. Run: claude update"
 }
 
-validate_claude_authentication() {
-  jq -e '.loggedIn == true and .authMethod == "claude.ai" and .apiProvider == "firstParty"' \
-    >/dev/null <<< "$1" || fail "Claude requires a direct Claude account login. Run: claude auth login"
+parse_claude_provider() {
+  jq -er 'select(.loggedIn == true and (.apiProvider == "bedrock" or .authMethod == "claude.ai"))
+    | {firstParty: "anthropic", bedrock: "amazon-bedrock"}[.apiProvider] // empty' <<< "$1" \
+    || fail "Claude requires a direct Claude account login (claude auth login)\
+ or Amazon Bedrock (CLAUDE_CODE_USE_BEDROCK=1)."
 }
 
 parse_claude_run() {
-  jq -sce --arg tier "$2" --arg requested_model "$3" \
+  jq -sce --arg tier "$2" --arg requested_model "$3" --arg provider "$4" \
     -f "$SCRIPT_ROOT/claude-run.jq" "$1"
 }
 
@@ -346,7 +352,8 @@ run_claude_once() {
     fail "Claude failed on run $run_number (exit $exit_code).\n$error_message\n$(<"$run_root/claude.stderr")"
     return 1
   }
-  result=$(parse_claude_run "$run_root/events.jsonl" "$SERVICE_TIER" "$REQUESTED_MODEL") || {
+  result=$(parse_claude_run "$run_root/events.jsonl" "$SERVICE_TIER" "$REQUESTED_MODEL" \
+    "$MODEL_PROVIDER") || {
     fail "Run $run_number did not produce a valid isolated Claude benchmark result."
     return 1
   }
@@ -564,8 +571,7 @@ print_header() {
     print "Codex CLI: $cli_version"
   fi
   print "jq: $jq_version"
-  [[ $BENCHMARK_CLI == claude ]] && print "Provider: Anthropic" \
-    || print "Provider: $(provider_name "$MODEL_PROVIDER")"
+  print "Provider: $(provider_name "$MODEL_PROVIDER")"
   print "Authentication: $AUTHENTICATION"
   print "Model: $model"
   print "Reasoning: $REASONING_EFFORT"
@@ -626,9 +632,16 @@ initialize() {
     local login_status
     login_status=$(run_isolated_claude "$BENCHMARK_ROOT" auth status --json) \
       || { fail "Claude authentication unavailable. Run: claude auth login"; return 1; }
-    validate_claude_authentication "$login_status"
-    MODEL_PROVIDER=anthropic
-    AUTHENTICATION="Claude account"
+    MODEL_PROVIDER=$(parse_claude_provider "$login_status")
+    if [[ $MODEL_PROVIDER == anthropic ]]; then
+      AUTHENTICATION="Claude account"
+      return 0
+    fi
+    AUTHENTICATION="AWS"
+    # Claude Code reads only AWS_REGION for Bedrock, unlike Codex's AWS_DEFAULT_REGION fallback.
+    AWS_BENCHMARK_REGION=${AWS_REGION:-}
+    [[ -n $AWS_BENCHMARK_REGION ]] || fail "Claude Code on Amazon Bedrock requires AWS_REGION."
+    [[ $SERVICE_TIER == default ]] || fail "Fast mode is not available on Amazon Bedrock."
     return 0
   fi
   CODEX_BIN=$(command -v codex)

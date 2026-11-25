@@ -4,7 +4,7 @@ A small macOS benchmark for comparing Codex and Claude Code text-generation spee
 
 ## Requirements
 
-- A logged-in Codex CLI, or Claude Code 2.1.281 or later with a direct Claude account login
+- A logged-in Codex CLI, or Claude Code 2.1.281 or later with a direct Claude account login or Amazon Bedrock
 - `jq` (`brew install jq`)
 
 ## Run
@@ -16,6 +16,8 @@ A small macOS benchmark for comparing Codex and Claude Code text-generation spee
 ./benchmark.zsh --model gpt-5.6-sol --service-tier fast
 ./benchmark.zsh --cli claude --model claude-opus-5-5
 ./benchmark.zsh --cli claude --model claude-opus-5-5 --service-tier fast
+CLAUDE_CODE_USE_BEDROCK=1 AWS_PROFILE=ClaudeCode AWS_REGION=us-west-2 \
+  ./benchmark.zsh --cli claude --model global.anthropic.claude-opus-5-5
 ```
 
 Running `sh benchmark.zsh` is also supported; the script automatically re-executes itself with macOS's `/bin/zsh`.
@@ -50,9 +52,15 @@ Claude runs use the same prompt, one warm-up and five measured requests, with th
 
 Thinking is requested off with `MAX_THINKING_TOKENS=0`, and effort is explicitly `low`. Models that require thinking, including Opus 5.5, retain adaptive thinking and are supported. The model may use zero or nonzero thinking tokens on each request. See [model configuration](https://code.claude.com/docs/en/model-config).
 
-Claude starts in a temporary working directory with safe mode, user/project/local settings ignored, tools and MCP servers disabled, skills disabled, hooks disabled, and session persistence disabled. Every response's initialization metadata is checked. The built-in `agents-md` and `telemetry` plugins remain in Claude Code 2.1.281 and are listed in the summary; custom plugins are rejected. Administrative policy still applies.
+Claude starts in a temporary working directory with safe mode, user/project/local settings ignored, tools and MCP servers disabled, skills disabled, hooks disabled, and session persistence disabled. Every response's initialization metadata is checked. Built-in plugins (`path` `builtin`, source `<name>@builtin`) cannot be disabled and are listed in the summary; their names change between releases (`agents-md` and `telemetry` in 2.1.281, `cc-plugin-*` in 2.1.325). Any other plugin is rejected. Administrative policy still applies.
 
-Settings and caches are redirected to a temporary `CLAUDE_CONFIG_DIR`. `CLAUDE_SECURESTORAGE_CONFIG_DIR` points to the original credential store (preserving its existing override, or the original `CLAUDE_CONFIG_DIR`, when set). This behavior was verified on 2.1.281. The script does not extract tokens or edit your saved settings. Claude may refresh credentials in the original credential store. All benchmark temporary data is deleted on exit, and an active CLI process is terminated on interruption. This first version supports direct Claude account authentication; Claude API-key and third-party-provider configurations are rejected.
+Settings and caches are redirected to a temporary `CLAUDE_CONFIG_DIR`. `CLAUDE_SECURESTORAGE_CONFIG_DIR` points to the original credential store (preserving its existing override, or the original `CLAUDE_CONFIG_DIR`, when set). This behavior was verified on 2.1.281. The script does not extract tokens or edit your saved settings. Claude may refresh credentials in the original credential store. All benchmark temporary data is deleted on exit, and an active CLI process is terminated on interruption. Direct Claude account and Amazon Bedrock authentication are supported; Claude API-key and other third-party-provider configurations are rejected.
+
+#### Claude Code on Amazon Bedrock
+
+Because user settings are ignored, the Bedrock configuration in `~/.claude/settings.json` does not apply. Export `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`, and, if needed, `AWS_PROFILE` for the run, as in the example above. The provider comes from `claude auth status` (`apiProvider` `bedrock`), and every response must report the `bedrock` provider. The telemetry caveat in the Codex Bedrock section applies here too.
+
+Pass the Bedrock model or inference profile ID, for example `global.anthropic.claude-opus-5-5` or `us.anthropic.claude-opus-5-5`. Claude Code records the profile ID as the model, while streamed messages carry the canonical ID (`claude-opus-5-5`); both are accepted when they belong to the same `modelUsage` entry. Fast mode is not available on Bedrock, so `--service-tier fast` is rejected before any request is made.
 
 ## Metrics
 

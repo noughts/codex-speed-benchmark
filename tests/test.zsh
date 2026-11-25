@@ -52,6 +52,7 @@ test_model_provider() {
   assert_equal "custom-model" "$(model_for_provider amazon-bedrock custom-model)" "model ID is unchanged"
   assert_equal "OpenAI" "$(provider_name openai)" "OpenAI provider name"
   assert_equal "Amazon Bedrock" "$(provider_name amazon-bedrock)" "Bedrock provider name"
+  assert_equal "Anthropic" "$(provider_name anthropic)" "Anthropic provider name"
   assert_equal "openai" "$(validate_model_provider openai)" "supported provider"
   ! validate_model_provider custom >/dev/null 2>&1 || fail "custom provider should be rejected"
 }
@@ -170,38 +171,44 @@ test_claude_requirements() {
   validate_claude_version '2.2.0 (Claude Code)'
   ! validate_claude_version '2.1.280 (Claude Code)' >/dev/null 2>&1 || fail "old Claude should fail"
   ! validate_claude_version 'unknown' >/dev/null 2>&1 || fail "unknown version should fail"
-  validate_claude_authentication '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'
+  assert_equal anthropic \
+    "$(parse_claude_provider '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}')" \
+    "Claude account provider"
+  assert_equal amazon-bedrock \
+    "$(parse_claude_provider '{"loggedIn":true,"authMethod":"third_party","apiProvider":"bedrock"}')" \
+    "Bedrock provider"
   local report
   for report in \
     '{"loggedIn":false,"authMethod":"claude.ai","apiProvider":"firstParty"}' \
+    '{"loggedIn":false,"authMethod":"third_party","apiProvider":"bedrock"}' \
     '{"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty"}' \
-    '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"bedrock"}'; do
-    ! validate_claude_authentication "$report" >/dev/null 2>&1 || fail "unsupported Claude auth should fail"
+    '{"loggedIn":true,"authMethod":"third_party","apiProvider":"vertex"}'; do
+    ! parse_claude_provider "$report" >/dev/null 2>&1 || fail "unsupported Claude auth should fail: $report"
   done
 }
 
 test_claude_parser() {
   local fixture="$TEST_ROOT/fixtures/claude-success.jsonl"
-  local result=$(parse_claude_run "$fixture" fast claude-opus-5-5)
+  local result=$(parse_claude_run "$fixture" fast claude-opus-5-5 anthropic)
   assert_json_field 50 total_tps "$result"
   assert_json_field 40 visible_tps "$result"
   assert_json_field 2000 ttft_ms "$result"
   assert_json_field fast speed "$result"
   assert_json_field 100 thinking_tokens "$result"
-  parse_claude_run "$fixture" fast opus >/dev/null
-  ! parse_claude_run "$fixture" default opus >/dev/null 2>&1 || fail "speed mismatch should fail"
-  ! parse_claude_run "$fixture" fast claude-sonnet-5 >/dev/null 2>&1 || fail "model mismatch should fail"
+  parse_claude_run "$fixture" fast opus anthropic >/dev/null
+  ! parse_claude_run "$fixture" default opus anthropic >/dev/null 2>&1 || fail "speed mismatch should fail"
+  ! parse_claude_run "$fixture" fast claude-sonnet-5 anthropic >/dev/null 2>&1 || fail "model mismatch should fail"
 
   TEST_DIR=$(mktemp -d /tmp/claude-benchmark-tests.XXXXXX)
   local changed="$TEST_DIR/events.jsonl"
   jq -c 'if .type == "result" then .usage.output_tokens_details.thinking_tokens = 0 else . end' "$fixture" > "$changed"
-  result=$(parse_claude_run "$changed" fast opus)
+  result=$(parse_claude_run "$changed" fast opus anthropic)
   assert_json_field 50 visible_tps "$result"
   jq -c 'if .type == "result" then del(.usage.output_tokens_details) else . end' "$fixture" > "$changed"
-  result=$(parse_claude_run "$changed" fast opus)
+  result=$(parse_claude_run "$changed" fast opus anthropic)
   assert_json_field null visible_tps "$result"
   print -r -- "$result" > "$TEST_DIR/results.jsonl"
-  parse_claude_run "$fixture" fast opus >> "$TEST_DIR/results.jsonl"
+  parse_claude_run "$fixture" fast opus anthropic >> "$TEST_DIR/results.jsonl"
   assert_json_field null visible_tps "$(median_summary "$TEST_DIR/results.jsonl")"
   [[ "$(print_run_table "$TEST_DIR/results.jsonl")" == *N/A* ]] || fail "missing visible TPS should display N/A"
   [[ "$(print_medians "$(median_summary "$TEST_DIR/results.jsonl")")" == *'Median Visible TPS: N/A'* ]] \
@@ -209,7 +216,30 @@ test_claude_parser() {
 
   jq -c 'if .type == "result" then .usage.speed = "standard"
     elif .event.type? == "message_start" then del(.event.message.usage.speed) else . end' "$fixture" > "$changed"
-  assert_json_field standard speed "$(parse_claude_run "$changed" default opus)"
+  assert_json_field standard speed "$(parse_claude_run "$changed" default opus anthropic)"
+
+  # Bedrock reports the inference profile in init and modelUsage, and the canonical ID in messages.
+  local profile=global.anthropic.claude-opus-5-5 bedrock="$TEST_DIR/bedrock.jsonl"
+  jq -c --arg profile "$profile" '
+    if .subtype == "init" then .model = $profile
+    elif .type == "result" then .modelUsage = {($profile): (.modelUsage["claude-opus-5-5"]
+      + {provider: "bedrock", canonicalModel: "claude-opus-5-5"})}
+    else . end' "$changed" > "$bedrock"
+  assert_json_field "$profile" model "$(parse_claude_run "$bedrock" default "$profile" amazon-bedrock)"
+  parse_claude_run "$bedrock" default opus amazon-bedrock >/dev/null
+  ! parse_claude_run "$bedrock" default "$profile" anthropic >/dev/null 2>&1 \
+    || fail "Bedrock usage should fail a Claude account run"
+  ! parse_claude_run "$bedrock" default us.anthropic.claude-opus-5-5 amazon-bedrock >/dev/null 2>&1 \
+    || fail "a different inference profile should fail"
+  jq -c 'if .type == "assistant" then .message.model = "claude-sonnet-5" else . end' "$bedrock" > "$changed"
+  ! parse_claude_run "$changed" default "$profile" amazon-bedrock >/dev/null 2>&1 \
+    || fail "a canonical model other than the profile's should fail"
+
+  # Built-in plugin names change between Claude Code releases; any built-in is recorded.
+  jq -c 'if .subtype == "init" then .plugins += [{name:"cc-plugin-privacy",path:"builtin",
+    source:"cc-plugin-privacy@builtin"}] else . end' "$fixture" > "$changed"
+  assert_equal '["agents-md","cc-plugin-privacy","telemetry"]' \
+    "$(parse_claude_run "$changed" fast opus anthropic | jq -c .builtin_plugins)" "built-in plugins"
 
   local filter
   for filter in \
@@ -222,6 +252,7 @@ test_claude_parser() {
     'if .subtype == "init" then .mcp_servers = [{name:"custom"}] else . end' \
     'if .subtype == "init" then .skills = ["custom"] else . end' \
     'if .subtype == "init" then .plugins[0].path = "/custom" else . end' \
+    'if .subtype == "init" then .plugins[0].source = "agents-md@custom" else . end' \
     'if .type == "assistant" then .message.content = [{type:"tool_use",name:"Bash"}] else . end' \
     'if .event.type? == "content_block_start" then .event.content_block.type = "tool_use" else . end' \
     'if .type == "assistant" then .message.model = "other" else . end' \
@@ -244,7 +275,7 @@ test_claude_parser() {
     'if .event.type? == "message_start" then .event.message.usage.speed = "standard" else . end' \
     '., (if .type == "result" then {type:"system",subtype:"hook_started"} else empty end)'; do
     jq -c "$filter" "$fixture" > "$changed"
-    ! parse_claude_run "$changed" fast opus >/dev/null 2>&1 || fail "invalid Claude result accepted: $filter"
+    ! parse_claude_run "$changed" fast opus anthropic >/dev/null 2>&1 || fail "invalid Claude result accepted: $filter"
   done
   rm -rf "$TEST_DIR"
   TEST_DIR=""
