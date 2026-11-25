@@ -14,6 +14,8 @@ def empty_array: type == "array" and length == 0;
 | $turn.usage as $usage
 | $usage.output_tokens_details.thinking_tokens as $thinking_tokens
 | (if $tier == "fast" then "fast" else "standard" end) as $speed
+# Bedrock reports an inference profile ID in init and the canonical ID in messages.
+| [$init.model, ($turn.modelUsage[$init.model]?.canonicalModel? // empty)] as $models
 | if $turn.subtype != "success" or $turn.is_error != false
     or $turn.num_turns != 1 or $turn.stop_reason != "end_turn" then
     error("Claude did not complete exactly one successful turn")
@@ -28,18 +30,18 @@ def empty_array: type == "array" and length == 0;
   elif ([$init.tools, $init.mcp_servers, $init.skills] | all(.[]; empty_array) | not) then
     error("tools, MCP servers, or skills are not disabled")
   elif ($init.plugins | type) != "array" then error("plugin metadata missing")
-  elif any($init.plugins[];
-    .path != "builtin" or (.name | IN("agents-md", "telemetry") | not)
-    or .source != (.name + "@builtin")) then error("unexpected plugin loaded")
+  elif any($init.plugins[]; .path != "builtin" or .source != (.name + "@builtin")) then
+    error("unexpected plugin loaded")
   elif ($init.model | type) != "string" or $init.model == "" then error("model missing")
-  elif ($requested_model | startswith("claude-")) and $requested_model != $init.model then
+  elif ($requested_model | contains("claude-")) and ($requested_model | IN($models[]) | not) then
     error("requested model was changed")
   elif ($turn.modelUsage | type) != "object" then error("model usage missing")
   elif ($turn.modelUsage | keys) != [$init.model] then error("model changed or multiple models used")
-  elif $turn.modelUsage[$init.model].provider != "firstParty" then error("unexpected provider")
-  elif any($events[] | select(.type == "assistant"); .message.model != $init.model) then
+  elif {firstParty: "anthropic", bedrock: "amazon-bedrock"}[$turn.modelUsage[$init.model].provider]
+    != $provider then error("unexpected provider")
+  elif any($events[] | select(.type == "assistant"); .message.model | IN($models[]) | not) then
     error("assistant model changed")
-  elif any($stream[] | select(.type == "message_start"); .message.model != $init.model) then
+  elif any($stream[] | select(.type == "message_start"); .message.model | IN($models[]) | not) then
     error("stream model changed")
   elif $usage.speed != $speed then error("actual speed missing or different from requested speed")
   elif any($stream[] | select(.type == "message_start");
